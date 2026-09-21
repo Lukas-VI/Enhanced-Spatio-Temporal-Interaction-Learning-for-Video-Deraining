@@ -1,3 +1,24 @@
+# ==============================================================================
+# train_ddp.py —— 分布式数据并行（DDP）训练脚本（变体）
+# ------------------------------------------------------------------------------
+# 与 train.py 的关系：
+#   - 同样是「粗网络 + 精网络」两阶段训练思路，但改用 PyTorch 的 DDP
+#     （DistributedDataParallel）做多进程并行训练；
+#   - 采用 mp.spawn 启动多进程，每个进程负责一个 GPU（此处 world_size=2）。
+#
+# 注意（重要）：
+#   1. 本文件是作者保留的实验变体：绝大部分「精网络训练」代码（优化 F 那段）
+#      被注释掉了，实际只训练「粗网络」；
+#   2. 冻结(freeze)时对 net 调用 .train() / 未冻结时调用 .eval()，这与常规
+#      语义是「反的」，应为原作者笔误——由于被冻结的模型不参与反向传播，
+#      该问题在数值上影响有限，但逻辑上确实反了（理解存疑）；
+#   3. 主函数硬编码 world_size=2，用 gloo backend 做进程组初始化。
+#
+# 主干流程：
+#   main() -> mp.spawn(ddp_main, world_size=2)
+#             ddp_main -> setup(初始化进程组) -> train(每进程各自训练) -> cleanup
+# ==============================================================================
+
 import shutil
 import sys
 import time
@@ -32,6 +53,11 @@ logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
 torch.backends.cudnn.benchmark = True
 
 
+# =============================================================
+# validate(args, net_C, net_F)
+# 训练过程中的验证函数：仅在验证集前几个 batch 上评估 PSNR
+# （注意：DDP 变体中此函数为保留代码，训练循环里并未实际被调用）
+# =============================================================
 def validate(args, net_C, net_F):
     # manually release GPU memory.
     torch.cuda.empty_cache()
@@ -71,6 +97,7 @@ def validate(args, net_C, net_F):
             time_C.update(c_now - end)
 
             model_out_F = net_F(model_out_C, inp_videos)  # (b, c, 1, h, w)
+            # DDP 变体此处对 F 输出先 unsqueeze(2) 再 squeeze(2)，用于兼容时间维约定
             model_out_F = clamp_on_imagenet_stats(model_out_F.unsqueeze(2)).squeeze(2)
             time_F.update(time.time() - c_now)
 
@@ -78,6 +105,9 @@ def validate(args, net_C, net_F):
             end = time.time()
 
         # validation range for output of coarse network
+        # 决定评估粗网络输出的哪些帧：
+        #   args.val_mode == 'full'  -> 全部 nf 帧
+        #   args.val_mode == 'mid'   -> 仅中间帧
         if args.val_mode == 'full':
             val_range = range(nf)
         elif args.val_mode == 'mid':
@@ -96,6 +126,7 @@ def validate(args, net_C, net_F):
                 all_inp_psnr_C.update(inp_psnr_C)
 
             # validate for output of fine network
+            # DDP 变体只对中间帧 (nf//2) 评估精网络
             out_F, gt_F, inp_F = model_out_F[i, :, :, :], gt_videos[i, :, nf // 2, :, :], model_out_C[i, :, nf // 2, :, :]
 
             out_psnr_F, inp_psnr_F = calculate_psnr(gt_F, out_F), calculate_psnr(gt_F, inp_F)
@@ -121,6 +152,7 @@ def validate(args, net_C, net_F):
 
 
 def train(args, rank):
+    # rank 标识当前进程是第几个 GPU
     print(f"Running basic DDP example on rank {rank}.")
 
     train_loader = get_train_loader(args)
@@ -129,9 +161,11 @@ def train(args, rank):
     # net_C = nn.DataParallel(net_C)
     # net_F = nn.DataParallel(net_F)
 
+    # 用 DDP 把模型包装到当前 rank 对应的 GPU 上，device_ids 指向该 rank
     net_C = DDP(net_C.to(rank), device_ids=[rank])
     net_F = DDP(net_F.to(rank), device_ids=[rank])
 
+    # 以下两行被注释：断点续训逻辑在 DDP 变体中未启用
     # start_epoch = max(load_checkpoint(args, net_C, args.checkpoint_dir_C),
     #                   load_checkpoint(args, net_F, args.checkpoint_dir_F)
     #                   )
@@ -144,6 +178,7 @@ def train(args, rank):
     # net_C.cuda()
     # net_F.cuda()
 
+    # 分别为粗、精网络构建优化器
     optimizer_C = build_optimizer(model=net_C,
                                   learning_rate=args.lr_C,
                                   optimizer_name=args.optimizer_name,
@@ -163,6 +198,7 @@ def train(args, rank):
     best_psnr_C, best_psnr_F = 0., 0.
     for epoch in range(start_epoch, args.epochs):
         # ===== train =====
+        # 每个 epoch 先按余弦/分段等策略调整两个网络的学习率
         adjust_learning_rate(optimizer_C, epoch, args.lr_C)
         adjust_learning_rate(optimizer_F, epoch, args.lr_F)
         logging.info('Epoch {} learning rate {} for C, {} for F'.format(epoch, optimizer_C.param_groups[0]['lr'], optimizer_F.param_groups[0]['lr']))
@@ -174,6 +210,10 @@ def train(args, rank):
         losses_F = AverageMeter()
 
         # mutate model train / eval states
+        # 注意（理解存疑）：这里逻辑是「反」的——
+        #   冻结(freeze)时调用 .train()，训练时反而调用 .eval()。
+        # 常规语义应相反（冻结->eval，训练->train）。由于作者未改，
+        # 我们原样保留并如实注释。影响：被冻结模型的 BN/统计口径与预期不同。
         if args.freeze_net_C:
             logging.info('Freezing coarse network.')
             net_C.train()
@@ -195,6 +235,7 @@ def train(args, rank):
             batch_size, _, nf, _, _ = in_videos_C.shape
 
             # ===== optimize coarse network =====
+            # 冻结粗网络时只前向算损失（不进优化器）；否则正常反向传播并更新
             if args.freeze_net_C:
                 with torch.no_grad():
                     model_out_C = net_C(in_videos_C)
@@ -204,6 +245,7 @@ def train(args, rank):
 
                 model_out_C = net_C(in_videos_C)  # (b, c, d, h, w)
                 # compute loss of coarse net and update
+                # 粗网络输出整段 d 帧，直接对整段做 MSE（像素级回归）
                 loss_C = F.mse_loss(model_out_C, gt_videos_C)
                 loss_C.backward()
                 optimizer_C.step()
@@ -214,6 +256,9 @@ def train(args, rank):
             batch_time_C.update(c_end - end)
 
             # ===== optimize fine network =====
+            # 以下一整段「精网络训练」在 DDP 变体中被作者注释调，即本变体实际
+            # 只训练粗网络。(若启用，其思路是取中间帧为gt，精网络输入需
+            # .detach() 切断对粗网络的梯度回传)
             # take the frame in the middle as ground truth.
             # gt_frames_F = gt_videos_C[:, :, gt_videos_C.shape[2] // 2, :, :]
             #
@@ -238,7 +283,9 @@ def train(args, rank):
             # batch_time.update(time.time() - end)
             # end = time.time()
 
+            # 全局迭代步数（跨 epoch 累计），供日志使用
             global_step = len(train_loader) * epoch + batch_idx
+            # 每 batch 输出训练日志
             if batch_idx % 1 == 0:
                 logging.info(('Epoch: [{0}][{1}/{2}]\t'
                               'iters: {3}\t'
@@ -252,6 +299,8 @@ def train(args, rank):
                                       loss_C=losses_C, loss_F=losses_F)
                               ))
 
+        # 以下保存 checkpoint 与「每间隔 epoch 验证、保存最优」的代码均被作者注释调，
+        # 因此本 DDP 变体运行时不会实际保存模型或调用验证。
         # if (epoch + 1) % 1 == 0:
         #     save_checkpoint(net_C.state_dict(),
         #                     filename=args.checkpoint_dir_C + "checkpoints_small_" + str(epoch + 1) + ".pth.tar")
@@ -280,19 +329,26 @@ def train(args, rank):
         #         logging.info('Best F PSNR {} found at {} epoch'.format(best_psnr_F, epoch))
 
 
+# =============================================================
+# DDP 进程组初始化相关
+# =============================================================
 def setup(rank, world_size):
+    # 设置主节点地址与端口，供各进程通信
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
 
     # initialize the process group
+    # 初始化并行进程组；gloo backend 常用于 CPU 或无法用 NCCL 的环境
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
 
 
 def cleanup():
+    # 训练结束销毁进程组
     dist.destroy_process_group()
 
 
 def ddp_main(rank, world_size):
+    # 每个 rank 进程的入口：初始化进程组 -> 读取配置 -> 建目录 -> 训练 -> 清理
     setup(rank, world_size)
 
     args = get_args('train')
@@ -317,8 +373,10 @@ def main():
 
 
 if __name__ == '__main__':
+    # 固定为 2 个进程 / 2 个 GPU
     world_size = 2
 
+    # 用 mp.spawn 同时启动 world_size(2) 个 ddp_main 进程
     mp.spawn(ddp_main,
              args=(world_size,),
              nprocs=2,

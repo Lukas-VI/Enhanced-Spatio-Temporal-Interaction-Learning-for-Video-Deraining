@@ -1,3 +1,10 @@
+# ==============================================================================
+# gen_json_light.py —— 为轻度雨视频数据生成索引文件(.json)
+# ------------------------------------------------------------------------------
+# 作用：扫描「video_rain_light」测试数据生成逐帧索引。
+# 数据目录结构：<root>/gt/<序列>/x.jpg 为真值目录，<root>/input/<序列>/x.jpg 为雨图。
+# json 结构同前：每序列一个 list，每项 {'rain': 雨图, 'gt': 真值}。
+# ==============================================================================
 import os
 import json
 
@@ -21,6 +28,7 @@ input_prefix = 'input'
 gt_dir = os.path.join(root, gt_prefix)
 input_dir = os.path.join(root, input_prefix)
 
+# 遍历 gt 目录下的各序列
 all_dirs = sorted([os.path.join(gt_dir, x) for x in os.listdir(gt_dir)])
 
 entry_list = list()
@@ -31,6 +39,7 @@ for gt_d in all_dirs:
     entry = []
     c_entry = []
 
+    # 按帧号排序
     gt_frame_names = sorted(os.listdir(gt_d), key=lambda x: int(x[:-4]))
 
     for gt_fn in gt_frame_names:

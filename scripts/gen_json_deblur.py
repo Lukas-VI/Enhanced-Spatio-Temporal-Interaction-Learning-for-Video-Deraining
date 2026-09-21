@@ -1,3 +1,10 @@
+# ==============================================================================
+# gen_json_deblur.py —— 为视频去模糊数据生成索引文件(.json)
+# ------------------------------------------------------------------------------
+# 作用：扫描视频去模糊测试数据集，生成逐帧索引。
+# 此脚本是针对「去模糊(deblur)」任务的变体，改进：gt 在 <序列>/GT 目录，
+# 模糊输入(blur)在 <序列>/input 目录，键名为 blur / gt。
+# ==============================================================================
 import os
 import json
 
@@ -21,9 +28,11 @@ for d in all_dirs:
 
     prefix, filename = os.path.split(d)
 
+    # 每个序列含 GT(清晰) 与 input(模糊) 两个子目录
     gt_dirpath = os.path.join(d, 'GT')
     blur_dirpath = os.path.join(d, 'input')
 
+    # 以 GT 目录的文件名为基准（模糊与清晰帧同名）
     frame_names = sorted([f for f in os.listdir(gt_dirpath) if f.endswith('jpg')])
 
     for fn in frame_names:

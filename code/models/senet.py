@@ -2,6 +2,19 @@
 ResNet code gently borrowed from
 https://github.com/pytorch/vision/blob/master/torchvision/models/resnet.py
 """
+# ==============================================================================
+# senet.py —— 借用的 SENet / SE-ResNet / SE-ResNeXt 骨干实现
+# ------------------------------------------------------------------------------
+# 本文件从 cadene/pretrainedmodels 借用，加入 Squeeze-and-Excitation(SE) 通道注意力：
+#   1. SEModule: 全局平均池化 -> 两段 1x1 卷积(通道压缩/还原) -> sigmoid，
+#      对通道加权后逐通道相乘（重新校准特征）。
+#   2. Bottleneck 基础上衍生出三个变体：SEBottleneck(SENet154)、
+#      SEResNetBottleneck(SE-ResNet)、SEResNeXtBottleneck(SE-ResNeXt)。
+#   3. SENet 主体结构与 ResNet 相似，仅把 residual 后的输出先过 SE 模块。
+# 本项目只用其「特征提取」部分，分类头在编码器外壳中被截断。
+# 属借用实现，此处仅做概括性注释，不逐行展开。
+# 小提示：其 forward(x, x_) 中第二个参数 x_ 实际未被使用，为遗留参数。
+# ==============================================================================
 from collections import OrderedDict
 import math
 import torch
@@ -14,6 +27,7 @@ import numpy as np
 __all__ = ['SENet', 'senet154', 'se_resnet50', 'se_resnet101', 'se_resnet152',
            'se_resnext50_32x4d', 'se_resnext101_32x4d']
 
+# 各版本预训练权重配置（url / 输入取值范围 / mean / std / 类别数等）
 pretrained_settings = {
     'senet154': {
         'imagenet': {
@@ -85,7 +99,7 @@ pretrained_settings = {
 
 
 class SEModule(nn.Module):
-
+    # 通道注意力模块：squeeze(全局池化) -> excitation(两层1x1卷积) -> 逐通道加权
     def __init__(self, channels, reduction):
         super(SEModule, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
@@ -103,13 +117,15 @@ class SEModule(nn.Module):
         x = self.relu(x)
         x = self.fc2(x)
         x = self.sigmoid(x)
-        return module_input * x
+        return module_input * x    # 对每个通道乘上注意力权重
 
 
 class Bottleneck(nn.Module):
     """
     Base class for bottlenecks that implements `forward()` method.
     """
+    # 三个变体瓶颈块的公共前向逻辑：
+    #   conv1-bn-relu -> conv2-bn-relu -> conv3-bn -> SE -> +residual -> relu
     def forward(self, x):
         residual = x
 
@@ -127,7 +143,7 @@ class Bottleneck(nn.Module):
         if self.downsample is not None:
             residual = self.downsample(x)                
 
-        out = self.se_module(out) + residual
+        out = self.se_module(out) + residual    # 对瓶颈输出先做通道注意力再加残差
         out = self.relu(out)
 
         return out
@@ -137,6 +153,7 @@ class SEBottleneck(Bottleneck):
     """
     Bottleneck for SENet154.
     """
+    # SENet154 专用瓶颈块
     expansion = 4
 
     def __init__(self, inplanes, planes, groups, reduction, stride=1,
@@ -164,6 +181,7 @@ class SEResNetBottleneck(Bottleneck):
     implementation and uses `stride=stride` in `conv1` and not in `conv2`
     (the latter is used in the torchvision implementation of ResNet).
     """
+    # SE-ResNet 瓶颈块：把下采样 stride 放在 conv1 上（与 torchvision 的 conv2 相反）
     expansion = 4
 
     def __init__(self, inplanes, planes, groups, reduction, stride=1,
@@ -187,6 +205,7 @@ class SEResNeXtBottleneck(Bottleneck):
     """
     ResNeXt bottleneck type C with a Squeeze-and-Excitation module.
     """
+    # SE-ResNeXt 瓶颈块：中间 3x3 卷积使用分组卷积(Groups)
     expansion = 4
 
     def __init__(self, inplanes, planes, groups, reduction, stride=1,
@@ -354,6 +373,7 @@ class SENet(nn.Module):
 
 
     def features(self, x):
+        # 仅特征提取部分（conv 层），返回特征图
         x = self.layer0(x)
         x = self.layer1(x)
         x = self.layer2(x)
@@ -364,6 +384,7 @@ class SENet(nn.Module):
 
 
     def logits(self, x):
+        # 全局平均池化 -> 可选 dropout -> 展平 -> 全连接分类头
         x = self.avg_pool(x)
         if self.dropout is not None:
             x = self.dropout(x)
@@ -372,6 +393,7 @@ class SENet(nn.Module):
         return x
 
     def forward(self, x,x_):      
+        # 注意：第二个参数 x_ 在 forward 中未使用，为遗留参数（理解存疑）
         x = self.features(x)
         x = self.logits(x)
         return x

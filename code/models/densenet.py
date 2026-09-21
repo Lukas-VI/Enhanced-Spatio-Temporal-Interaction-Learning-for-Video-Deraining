@@ -1,3 +1,15 @@
+# ==============================================================================
+# densenet.py —— 借用的标准 DenseNet 骨干实现
+# ------------------------------------------------------------------------------
+# 本文件为从 torchvision 借用的经典 DenseNet 实现，提供 densenet121/169/201/161，
+# 可选 ImageNet 预训练权重。
+# 本项目只复用其「特征提取(卷积部分)」，分类头(classifier)在编码器外壳中被截断。
+# 属借用实现，此处仅做概括性注释，不逐行展开。
+# 核心概念：
+#   - _DenseLayer: BN->ReLU->1x1->BN->ReLU->3x3 后与输入在通道维拼接（密集连接）；
+#   - _DenseBlock: 由若干 DenseLayer 串联，每层把上一层的输出拼进来，通道数递增；
+#   - _Transition: 1x1 卷积降通道 + 2x2 平均池化降采样，放在 dense block 之间。
+# ==============================================================================
 import re
 import torch
 import torch.nn as nn
@@ -9,6 +21,7 @@ from collections import OrderedDict
 __all__ = ['DenseNet', 'densenet121', 'densenet169', 'densenet201', 'densenet161']
 
 
+# 各版本预训练权重下载地址
 model_urls = {
     'densenet121': 'https://download.pytorch.org/models/densenet121-a639ec97.pth',
     'densenet169': 'https://download.pytorch.org/models/densenet169-b2777c0a.pth',
@@ -125,7 +138,7 @@ def densenet161(pretrained=False, **kwargs):
     return model
 
 class _DenseLayer(nn.Sequential):
-
+    # 单个密集层：BN->ReLU->1x1->BN->ReLU->3x3，输出与输入在通道维拼接
     def __init__(self, num_input_features, growth_rate, bn_size, drop_rate):
         super(_DenseLayer, self).__init__()
         self.add_module('norm1', nn.BatchNorm2d(num_input_features)),
@@ -143,11 +156,11 @@ class _DenseLayer(nn.Sequential):
         if self.drop_rate > 0:
             new_features = F.dropout(
                 new_features, p=self.drop_rate, training=self.training)
-        return torch.cat([x, new_features], 1)
+        return torch.cat([x, new_features], 1)   # 密集连接：与输入拼接
 
 
 class _DenseBlock(nn.Sequential):
-
+    # 由多个 DenseLayer 组成的密集块，块内通道数逐层累加
     def __init__(self, num_layers, num_input_features, bn_size, growth_rate, drop_rate):
         super(_DenseBlock, self).__init__()
         for i in range(num_layers):
@@ -157,7 +170,7 @@ class _DenseBlock(nn.Sequential):
 
 
 class _Transition(nn.Sequential):
-
+    # 过渡层：1x1 卷积降通道 + 2x2 平均池化降分辨率
     def __init__(self, num_input_features, num_output_features):
         super(_Transition, self).__init__()
         self.add_module('norm', nn.BatchNorm2d(num_input_features))
@@ -169,13 +182,14 @@ class _Transition(nn.Sequential):
 
 
 class DenseNet(nn.Module):
-
+    # 完整 DenseNet：首卷积 + 若干 (DenseBlock, Transition) + 最终 BN + 分类头
     def __init__(self, growth_rate=32, block_config=(6, 12, 24, 16),
                  num_init_features=64, bn_size=4, drop_rate=0, num_classes=1000):
 
         super(DenseNet, self).__init__()
 
         # First convolution
+        # 输入层：7x7 卷积 + BN + ReLU + 最大池化
         self.features = nn.Sequential(OrderedDict([
             ('conv0', nn.Conv2d(3, num_init_features,
                                 kernel_size=7, stride=2, padding=3, bias=False)),
@@ -185,6 +199,7 @@ class DenseNet(nn.Module):
         ]))
 
         # Each denseblock
+        # 依次添加各 DenseBlock 与夹在中间的 Transition
         num_features = num_init_features
         for i, num_layers in enumerate(block_config):
             block = _DenseBlock(num_layers=num_layers, num_input_features=num_features,
@@ -209,6 +224,7 @@ class DenseNet(nn.Module):
     def forward(self, x):
         features = self.features(x)
         out = F.relu(features, inplace=True)
+        # 全局平均池化 -> 展平 -> 分类头
         out = F.avg_pool2d(out, kernel_size=7, stride=1).view(
             features.size(0), -1)
         out = self.classifier(out)

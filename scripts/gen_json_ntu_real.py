@@ -1,3 +1,10 @@
+# ==============================================================================
+# gen_json_ntu_real.py —— 为 NTU 真实雨数据生成索引文件(.json)
+# ------------------------------------------------------------------------------
+# 作用：扫描真实雨数据目录，生成与 gen_json_ntu.py 相同结构的 .json。
+# 注意差异：真实数据没有独立 GT 目录，gt 键与 rain 键指向同一张雨图
+# （真实雨图没有配对真值，仅用于测试观测）。
+# ==============================================================================
 import os
 import json
 
@@ -26,12 +33,14 @@ for d in all_dirs:
     # gt_dirname = filename[:-4] + 'GT'
     gt_dirpath = os.path.join(prefix, gt_dirname)
 
+    # 按字典序排列该序列的所有 jpg 帧
     frame_names = sorted(f for f in os.listdir(d) if f.endswith('.jpg'))
 
     for fn in frame_names:
         rain_filepath = os.path.join(prefix, filename, fn)
         gt_filepath = os.path.join(gt_dirpath, fn)
 
+        # 真实数据：gt 与 rain 相同（无真值）
         entry.append({'rain': rain_filepath, 'gt': rain_filepath})
 
     entry_list.append(entry)
